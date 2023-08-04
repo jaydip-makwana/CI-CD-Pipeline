@@ -1,0 +1,113 @@
+#  This Workflow will build the images, Tag each with ECR Repo, push it to ECR
+#  And run  deployment file (./deploy.sh)
+
+name: Entropy Prod CI/CD Pipeline
+
+on:
+  workflow_dispatch:
+
+env:
+  ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  SSH_HOST: ${{ secrets.SSH_PROD_HOST }}
+  SSH_USER: ${{secrets.SSH_PROD_USER}}
+  SSH_PRIVATE_KEY: ${{ secrets.SSH_PROD_PRIVATE_KEY }}
+  USER_NAME: ${{ secrets.GIT_USERNAME }}
+
+jobs:
+  Build:
+    runs-on: ubuntu-20.04
+    strategy:
+      matrix:
+        node-version: [ v10.19.0 ]
+        python-version: [ v3.9 ]
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Node ${{ matrix.node-version }}
+        uses: actions/setup-node@v3
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Set up Python ${{ matrix.python-version }} 🐍
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+
+        # Docker and Docker-compose is pre-installed in ubuntu 20.04
+      - name: Take code from repository 📥
+        uses: actions/checkout@v3
+
+      - name: build docker images 🏗️
+        run: |
+          docker-compose -f docker-compose.prod.yml build frontend backend
+          # ! As We can not re-build the services which uses only docker images.    
+          docker pull redis:alpine
+          docker pull rabbitmq:3-management
+      - name: Tag each docker images 🏷
+        run: |
+          docker tag frontend:latest ${{ env.ECR_REGISTRY }}/frontend-prod:latest
+          docker tag backend:latest ${{ env.ECR_REGISTRY }}/backend-prod:latest
+          docker tag redis:alpine ${{ env.ECR_REGISTRY }}/message-broker:latest
+          docker tag rabbitmq:3-management ${{ env.ECR_REGISTRY }}/rabbitmq:latest
+
+      - name: Configure AWS credentials ⚙️
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login with ECR 	🔐
+        uses: aws-actions/amazon-ecr-login@v1
+      - run: aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ env.ECR_REGISTRY }}
+
+      - name: Push images to ECR 	🏇
+        run: |
+          docker push ${{ env.ECR_REGISTRY }}/frontend-prod:latest
+          docker push ${{ env.ECR_REGISTRY }}/backend-prod:latest
+          docker push ${{ env.ECR_REGISTRY }}/rabbitmq:latest
+          docker push ${{ env.ECR_REGISTRY }}/message-broker:latest
+  Deploy:
+    runs-on: ubuntu-20.04
+    needs: Build
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Run ./Deploy.sh file  📁
+        uses: appleboy/ssh-action@v0.1.4
+        with:
+          host: ${{ env.SSH_HOST }}
+          username: ${{ env.SSH_USER }}
+          key: ${{ env.SSH_PRIVATE_KEY }}
+          script_stop: true
+          script: |
+            cd entropy 
+            git remote set-url origin https://${{env.USER_NAME}}:${{env.GITHUB_TOKEN}}@github.com/hplustree/entropy.git
+            # Added -q to do the operation with hiding logs, will raise the error if Github credentials is not assigned.
+            git fetch -q
+            git checkout entropy_individual_exchange_account_approach -q
+            git pull origin entropy_individual_exchange_account_approach -q
+            
+            export KOPS_STATE_STORE="s3://prod-makertaker-kops-states"
+            export SKAFFOLD_DEFAULT_REPO="186559136629.dkr.ecr.ap-south-1.amazonaws.com"
+
+            : "
+            We are getting some output logs as standard error messages, for example
+
+            err: Configure a credential helper to remove this warning. (more details,open step 'Run ./Deploy.sh file'  https://github.com/hplustree/entropy/actions/runs/3540781034/jobs/5944473136#:~:text=WARNING!%20Your%20password,login/%23credentials%2Dstore)
+            
+            For hiding above kind of messages, we've wrote command in bash script 
+            "            
+            
+            case $(kops export kubecfg --admin  2>&1) in  *"kOps has set your kubectl context"*) : ;;*) echo >&2 "Error in exporting kubecfg config !"; exit 1;esac
+            
+            case $(aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 186559136629.dkr.ecr.ap-south-1.amazonaws.com 2>&1) in  *"Login Succeeded"*): ;; *) echo >&2 "ECR Login Failed ! "; exit 1 ;;esac
+            
+            kubectl delete jobs calculate-overall-gain live-data-store live-data-stream live-ticker-stream watch-kubernetes fake-data-stream
+
+            skaffold deploy -f skaffold.prod.yaml -i backend-prod:latest -i frontend-prod:latest
